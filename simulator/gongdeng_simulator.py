@@ -22,6 +22,17 @@ logging.basicConfig(
 logger = logging.getLogger("GongdengSimulator")
 
 
+FUEL_TYPES = {
+    "animal_fat": {"name": "动物脂肪", "heating_value": 37.5, "modbus_value": 1, "temp_factor": 1.0},
+    "sesame_oil": {"name": "麻油", "heating_value": 39.3, "modbus_value": 2, "temp_factor": 1.03},
+    "beeswax": {"name": "蜜蜡", "heating_value": 40.6, "modbus_value": 3, "temp_factor": 1.05},
+    "mineral_oil": {"name": "矿物油", "heating_value": 44.0, "modbus_value": 4, "temp_factor": 1.12},
+    "tallow": {"name": "牛油", "heating_value": 39.0, "modbus_value": 5, "temp_factor": 1.02},
+}
+
+MODBUS_TO_FUEL = {v["modbus_value"]: k for k, v in FUEL_TYPES.items()}
+
+
 class GongdengSensorSimulator:
     """长信宫灯传感器模拟器"""
 
@@ -32,7 +43,10 @@ class GongdengSensorSimulator:
         modbus_port: int = 502,
         api_url: str = "http://localhost:8000",
         enable_modbus: bool = True,
-        enable_http: bool = True
+        enable_http: bool = True,
+        fuel_type: str = "animal_fat",
+        air_change_rate: float = 1.0,
+        outdoor_pm25: float = 25.0
     ):
         self.lamp_id = lamp_id
         self.modbus_host = modbus_host
@@ -40,6 +54,10 @@ class GongdengSensorSimulator:
         self.api_url = api_url
         self.enable_modbus = enable_modbus
         self.enable_http = enable_http
+
+        self.fuel_type = fuel_type
+        self.air_change_rate = air_change_rate
+        self.outdoor_pm25 = outdoor_pm25
 
         self.oil_level = 500.0
         self.base_flue_temp = 25.0
@@ -66,6 +84,9 @@ class GongdengSensorSimulator:
             7: 0,
             8: 0,
             9: 0,
+            10: 0,
+            11: 0,
+            12: 0,
         }
 
     def _update_modbus_registers(self, data: dict):
@@ -81,6 +102,9 @@ class GongdengSensorSimulator:
             self.registers[7] = int(data['lamp_id'])
             self.registers[8] = int(data['timestamp'] % 65536)
             self.registers[9] = int(data['timestamp'] / 65536)
+            self.registers[10] = int(FUEL_TYPES.get(data['fuel_type'], {}).get('modbus_value', 1))
+            self.registers[11] = int(data['air_change_rate'] * scale)
+            self.registers[12] = int(data['outdoor_pm25'] * scale)
 
             if self.modbus_server:
                 for addr, value in self.registers.items():
@@ -88,15 +112,23 @@ class GongdengSensorSimulator:
         except Exception as e:
             logger.error(f"更新Modbus寄存器失败: {e}")
 
+    def set_fuel_type(self, fuel_type: str):
+        """设置燃料类型"""
+        if fuel_type in FUEL_TYPES:
+            self.fuel_type = fuel_type
+            logger.info(f"燃料类型已切换为: {FUEL_TYPES[fuel_type]['name']}")
+
     def _simulate_oil_consumption(self) -> float:
         base = self.base_oil_consumption * self.flame_intensity
         noise = random.gauss(0, 0.1)
         return max(0.1, base + noise)
 
     def _simulate_flue_temperature(self) -> float:
-        base = self.base_flue_temp + (180.0 - self.base_flue_temp) * self.flame_intensity
+        fuel = FUEL_TYPES.get(self.fuel_type, FUEL_TYPES["animal_fat"])
+        base_temp = self.base_flue_temp + (180.0 - self.base_flue_temp) * self.flame_intensity
+        base_temp = base_temp * fuel["temp_factor"]
         cooling_effect = self.blockage_factor * 0.8
-        base = base * cooling_effect
+        base = base_temp * cooling_effect
         noise = random.gauss(0, 3.0)
         return max(self.base_flue_temp, base + noise)
 
@@ -141,6 +173,7 @@ class GongdengSensorSimulator:
     def generate_sensor_data(self) -> dict:
         self._random_anomaly()
 
+        fuel = FUEL_TYPES.get(self.fuel_type, FUEL_TYPES["animal_fat"])
         oil_consumption = self._simulate_oil_consumption()
         self.oil_level = max(0.0, self.oil_level - oil_consumption)
         if self.oil_level < 10.0:
@@ -164,6 +197,10 @@ class GongdengSensorSimulator:
             "ambient_temperature": round(ambient_temp, 2),
             "ambient_humidity": round(ambient_humidity, 2),
             "blockage_degree": round(self.blockage_degree, 3),
+            "fuel_type": self.fuel_type,
+            "fuel_name": fuel["name"],
+            "air_change_rate": round(self.air_change_rate, 2),
+            "outdoor_pm25": round(self.outdoor_pm25, 2),
             "timestamp": int(timestamp),
             "time": datetime.now().isoformat()
         }

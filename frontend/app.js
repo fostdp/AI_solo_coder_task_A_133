@@ -6,6 +6,9 @@ let currentView = 'lamp';
 let flameIntensity = 0.8;
 let blockageDegree = 0.0;
 let particleCount = 50;
+let fuelType = 'animal_fat';
+let airChangeRate = 1.0;
+let outdoorPm25 = 25.0;
 let autoUpdate = true;
 let currentSensorData = null;
 let currentFlueSim = null;
@@ -300,16 +303,18 @@ function createParticleSystem() {
     const trajectoryLines = [];
     const flowParticles = [];
 
-    particleSystem.userData = { trajectoryLines, flowParticles };
+    particleSystem.userData = {
+        trajectoryLines,
+        flowParticles,
+        flueWorldOffset: new THREE.Vector3(0, 1.65, 0)
+    };
     particleSystem.visible = false;
-    particleSystem.position.copy(lampGroup.position);
-    particleSystem.position.y += 1.65;
 
     scene.add(particleSystem);
 }
 
 function updateParticleTrajectories(trajectories, flueLength, flueDiameter) {
-    const { trajectoryLines, flowParticles } = particleSystem.userData;
+    const { trajectoryLines, flowParticles, flueWorldOffset } = particleSystem.userData;
 
     trajectoryLines.forEach(line => particleSystem.remove(line));
     flowParticles.forEach(p => particleSystem.remove(p));
@@ -318,9 +323,17 @@ function updateParticleTrajectories(trajectories, flueLength, flueDiameter) {
 
     const flowColors = [0xff6633, 0xff8844, 0xffaa55, 0xffcc66, 0xddaa44];
 
+    const lampWorldPos = new THREE.Vector3();
+    lampGroup.getWorldPosition(lampWorldPos);
+    const flueWorldBase = lampWorldPos.clone().add(flueWorldOffset);
+
     trajectories.forEach((traj, idx) => {
-        const points = traj.points.map(p => new THREE.Vector3(p[0], p[1], p[2]));
-        const geometry = new THREE.BufferGeometry().setFromPoints(points);
+        const worldPoints = traj.points.map(p => {
+            const localPoint = new THREE.Vector3(p[0], p[1], p[2]);
+            return localPoint.add(flueWorldBase);
+        });
+
+        const geometry = new THREE.BufferGeometry().setFromPoints(worldPoints);
 
         const color = flowColors[idx % flowColors.length];
         const material = new THREE.LineBasicMaterial({
@@ -330,6 +343,8 @@ function updateParticleTrajectories(trajectories, flueLength, flueDiameter) {
         });
 
         const line = new THREE.Line(geometry, material);
+        line.userData.isWorldSpace = true;
+        line.frustumCulled = false;
         trajectoryLines.push(line);
         particleSystem.add(line);
 
@@ -338,14 +353,17 @@ function updateParticleTrajectories(trajectories, flueLength, flueDiameter) {
             const particleMat = new THREE.MeshBasicMaterial({
                 color: color,
                 transparent: true,
-                opacity: 0.8
+                opacity: 0.8,
+                depthWrite: false
             });
             const particle = new THREE.Mesh(particleGeo, particleMat);
             particle.userData = {
-                trajectory: points,
+                trajectory: worldPoints,
                 progress: Math.random(),
-                speed: 0.003 + Math.random() * 0.003
+                speed: 0.003 + Math.random() * 0.003,
+                isWorldSpace: true
             };
+            particle.frustumCulled = false;
             flowParticles.push(particle);
             particleSystem.add(particle);
         }
@@ -362,14 +380,43 @@ function updateParticleTrajectories(trajectories, flueLength, flueDiameter) {
     const flueMat = new THREE.MeshBasicMaterial({
         color: 0x66aaff,
         transparent: true,
-        opacity: 0.1,
+        opacity: 0.15,
         side: THREE.DoubleSide,
-        wireframe: true
+        wireframe: true,
+        depthWrite: false
     });
     const flueWire = new THREE.Mesh(flueGeo, flueMat);
-    flueWire.position.y = flueLength / 2;
+    flueWire.position.copy(flueWorldBase);
+    flueWire.position.y += flueLength / 2;
+    flueWire.userData.isWorldSpace = true;
+    flueWire.frustumCulled = false;
     particleSystem.add(flueWire);
     trajectoryLines.push(flueWire);
+
+    const startMarkerGeo = new THREE.SphereGeometry(0.02, 16, 16);
+    const startMarkerMat = new THREE.MeshBasicMaterial({
+        color: 0x00ff88,
+        transparent: true,
+        opacity: 0.8
+    });
+    const startMarker = new THREE.Mesh(startMarkerGeo, startMarkerMat);
+    startMarker.position.copy(flueWorldBase);
+    startMarker.userData.isWorldSpace = true;
+    particleSystem.add(startMarker);
+    trajectoryLines.push(startMarker);
+
+    const endMarkerGeo = new THREE.SphereGeometry(0.015, 16, 16);
+    const endMarkerMat = new THREE.MeshBasicMaterial({
+        color: 0xff4488,
+        transparent: true,
+        opacity: 0.8
+    });
+    const endMarker = new THREE.Mesh(endMarkerGeo, endMarkerMat);
+    endMarker.position.copy(flueWorldBase);
+    endMarker.position.y += flueLength;
+    endMarker.userData.isWorldSpace = true;
+    particleSystem.add(endMarker);
+    trajectoryLines.push(endMarker);
 }
 
 function createPM25Cloud() {
@@ -534,6 +581,13 @@ function setupEventListeners() {
         });
     });
 
+    document.getElementById('fuel-select').addEventListener('change', (e) => {
+        fuelType = e.target.value;
+        if (currentView === 'particles') {
+            loadParticles();
+        }
+    });
+
     document.getElementById('flame-slider').addEventListener('input', (e) => {
         flameIntensity = parseFloat(e.target.value);
         document.getElementById('flame-val').textContent = flameIntensity.toFixed(2);
@@ -542,6 +596,16 @@ function setupEventListeners() {
     document.getElementById('blockage-slider').addEventListener('input', (e) => {
         blockageDegree = parseFloat(e.target.value);
         document.getElementById('blockage-val').textContent = blockageDegree.toFixed(2);
+    });
+
+    document.getElementById('ach-slider').addEventListener('input', (e) => {
+        airChangeRate = parseFloat(e.target.value);
+        document.getElementById('ach-val').textContent = airChangeRate.toFixed(1);
+    });
+
+    document.getElementById('outdoor-pm25-slider').addEventListener('input', (e) => {
+        outdoorPm25 = parseFloat(e.target.value);
+        document.getElementById('outdoor-pm25-val').textContent = Math.round(outdoorPm25);
     });
 
     document.getElementById('particles-slider').addEventListener('input', (e) => {
@@ -588,10 +652,21 @@ async function loadParticles() {
 
     try {
         const res = await fetch(
-            `/api/simulation/particles?flue_velocity=${vel}&flue_temperature=${temp}&num_particles=${particleCount}`
+            `/api/simulation/particles?flue_velocity=${vel}&flue_temperature=${temp}&num_particles=${particleCount}&fuel_type=${fuelType}`
         );
         const data = await res.json();
         updateParticleTrajectories(data.trajectories, data.flue_length, data.flue_diameter);
+        const simInfo = document.getElementById('sim-info');
+        if (data.fuel_name && simInfo) {
+            const fuelDiv = document.createElement('div');
+            fuelDiv.innerHTML = `燃料: <span>${data.fuel_name}</span>`;
+            const existingFuel = simInfo.querySelector('.fuel-info');
+            if (existingFuel) {
+                existingFuel.remove();
+            }
+            fuelDiv.className = 'fuel-info';
+            simInfo.insertBefore(fuelDiv, simInfo.firstChild);
+        }
     } catch (e) {
         console.warn('加载粒子数据失败，使用模拟数据');
         const mockTrajectories = generateMockTrajectories(particleCount);
@@ -683,7 +758,10 @@ async function triggerManualSimulation() {
         indoor_pm25: pm25,
         oil_level: 450,
         ambient_temperature: 24,
-        ambient_humidity: 55
+        ambient_humidity: 55,
+        fuel_type: fuelType,
+        air_change_rate: airChangeRate,
+        outdoor_pm25: outdoorPm25
     };
 
     try {

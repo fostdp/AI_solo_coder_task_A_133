@@ -11,6 +11,7 @@ class AirQualityAnalyzer:
     """
     空气质量分析与PM2.5扩散模型
     基于对流扩散方程评估宫灯对室内空气的净化效果
+    支持室内通风换气率参数修正
     """
 
     def __init__(
@@ -18,7 +19,11 @@ class AirQualityAnalyzer:
         room_size_x: float = 10.0,
         room_size_y: float = 8.0,
         room_size_z: float = 3.0,
-        grid_resolution: int = 5
+        grid_resolution: int = 5,
+        air_change_rate: float = 0.5,
+        outdoor_pm25: float = 35.0,
+        inlet_position: tuple = (0.0, 4.0, 2.0),
+        outlet_position: tuple = (10.0, 4.0, 2.0)
     ):
         self.room_size_x = room_size_x
         self.room_size_y = room_size_y
@@ -28,6 +33,14 @@ class AirQualityAnalyzer:
         self.D_pm25_base = 1.5e-7
         self.lamp_position = (room_size_x / 2, room_size_y / 2, 1.5)
         self.purification_efficiency = 0.3
+
+        self.air_change_rate = air_change_rate
+        self.outdoor_pm25 = outdoor_pm25
+        self.inlet_position = inlet_position
+        self.outlet_position = outlet_position
+
+        self._ventilation_decay = air_change_rate / 60.0
+        self._calculate_velocity_field()
 
     def _get_aqi_level(self, pm25: float) -> str:
         if pm25 <= 35:
@@ -53,6 +66,198 @@ class AirQualityAnalyzer:
             "严重污染": "健康人群运动耐受力降低，有明显强烈症状，提前出现某些疾病"
         }
         return risks.get(aqi_level, "未知")
+
+    def set_ventilation_parameters(
+        self,
+        air_change_rate: Optional[float] = None,
+        outdoor_pm25: Optional[float] = None,
+        inlet_position: Optional[tuple] = None,
+        outlet_position: Optional[tuple] = None
+    ):
+        """设置通风参数"""
+        if air_change_rate is not None:
+            self.air_change_rate = air_change_rate
+            self._ventilation_decay = air_change_rate / 60.0
+        if outdoor_pm25 is not None:
+            self.outdoor_pm25 = outdoor_pm25
+        if inlet_position is not None:
+            self.inlet_position = inlet_position
+        if outlet_position is not None:
+            self.outlet_position = outlet_position
+
+        self._calculate_velocity_field()
+        logger.info(
+            f"通风参数已更新: ACH={self.air_change_rate}, "
+            f"室外PM2.5={self.outdoor_pm25}μg/m³"
+        )
+
+    def _calculate_velocity_field(self):
+        """
+        基于换气率和进出口位置计算室内速度场
+        采用简化的势流模型 + 粘性衰减
+        """
+        nx, ny, nz = self.grid_resolution, self.grid_resolution, self.grid_resolution
+        self.velocity_field = np.zeros((3, nx, ny, nz))
+
+        if self.air_change_rate <= 0:
+            return
+
+        room_volume = self.room_size_x * self.room_size_y * self.room_size_z
+        total_flow_rate = (self.air_change_rate / 3600.0) * room_volume
+
+        dx = self.room_size_x / max(nx - 1, 1)
+        dy = self.room_size_y / max(ny - 1, 1)
+        dz = self.room_size_z / max(nz - 1, 1)
+
+        inlet_gx = int(self.inlet_position[0] / self.room_size_x * (nx - 1))
+        inlet_gy = int(self.inlet_position[1] / self.room_size_y * (ny - 1))
+        inlet_gz = int(self.inlet_position[2] / self.room_size_z * (nz - 1))
+
+        outlet_gx = int(self.outlet_position[0] / self.room_size_x * (nx - 1))
+        outlet_gy = int(self.outlet_position[1] / self.room_size_y * (ny - 1))
+        outlet_gz = int(self.outlet_position[2] / self.room_size_z * (nz - 1))
+
+        inlet_gx = max(0, min(nx - 1, inlet_gx))
+        inlet_gy = max(0, min(ny - 1, inlet_gy))
+        inlet_gz = max(0, min(nz - 1, inlet_gz))
+        outlet_gx = max(0, min(nx - 1, outlet_gx))
+        outlet_gy = max(0, min(ny - 1, outlet_gy))
+        outlet_gz = max(0, min(nz - 1, outlet_gz))
+
+        avg_velocity = total_flow_rate / max(dx * dy * 10, 1e-6)
+
+        for i in range(nx):
+            for j in range(ny):
+                for k in range(nz):
+                    wx = i * dx
+                    wy = j * dy
+                    wz = k * dz
+
+                    dist_to_inlet = math.sqrt(
+                        (wx - self.inlet_position[0]) ** 2 +
+                        (wy - self.inlet_position[1]) ** 2 +
+                        (wz - self.inlet_position[2]) ** 2
+                    )
+                    dist_to_outlet = math.sqrt(
+                        (wx - self.outlet_position[0]) ** 2 +
+                        (wy - self.outlet_position[1]) ** 2 +
+                        (wz - self.outlet_position[2]) ** 2
+                    )
+
+                    dist_to_inlet = max(dist_to_inlet, 0.1)
+                    dist_to_outlet = max(dist_to_outlet, 0.1)
+
+                    vel_in_mag = avg_velocity * math.exp(-dist_to_inlet / 1.5)
+                    vel_out_mag = avg_velocity * math.exp(-dist_to_outlet / 1.5)
+
+                    if dist_to_inlet > 0:
+                        vx_in = vel_in_mag * (wx - self.inlet_position[0]) / dist_to_inlet
+                        vy_in = vel_in_mag * (wy - self.inlet_position[1]) / dist_to_inlet
+                        vz_in = vel_in_mag * (wz - self.inlet_position[2]) / dist_to_inlet
+                    else:
+                        vx_in = vy_in = vz_in = 0
+
+                    if dist_to_outlet > 0:
+                        vx_out = -vel_out_mag * (wx - self.outlet_position[0]) / dist_to_outlet
+                        vy_out = -vel_out_mag * (wy - self.outlet_position[1]) / dist_to_outlet
+                        vz_out = -vel_out_mag * (wz - self.outlet_position[2]) / dist_to_outlet
+                    else:
+                        vx_out = vy_out = vz_out = 0
+
+                    self.velocity_field[0, i, j, k] = 0.6 * vx_in + 0.4 * vx_out
+                    self.velocity_field[1, i, j, k] = 0.6 * vy_in + 0.4 * vy_out
+                    self.velocity_field[2, i, j, k] = 0.6 * vz_in + 0.4 * vz_out
+
+        logger.debug(
+            f"速度场计算完成: 最大速度={np.max(np.abs(self.velocity_field)):.4f}m/s, "
+            f"换气率={self.air_change_rate}次/小时"
+        )
+
+    def _calculate_convective_term(
+        self,
+        concentration_field: np.ndarray,
+        velocity_field: np.ndarray,
+        dx: float,
+        dy: float,
+        dz: float
+    ) -> np.ndarray:
+        """
+        计算对流项 u·∇C
+        使用迎风格式提高数值稳定性
+        """
+        nx, ny, nz = concentration_field.shape
+        convective = np.zeros_like(concentration_field)
+
+        for i in range(1, nx - 1):
+            for j in range(1, ny - 1):
+                for k in range(1, nz - 1):
+                    ux = velocity_field[0, i, j, k]
+                    uy = velocity_field[1, i, j, k]
+                    uz = velocity_field[2, i, j, k]
+
+                    if ux > 0:
+                        dC_dx = (concentration_field[i, j, k] - concentration_field[i - 1, j, k]) / dx
+                    else:
+                        dC_dx = (concentration_field[i + 1, j, k] - concentration_field[i, j, k]) / dx
+
+                    if uy > 0:
+                        dC_dy = (concentration_field[i, j, k] - concentration_field[i, j - 1, k]) / dy
+                    else:
+                        dC_dy = (concentration_field[i, j + 1, k] - concentration_field[i, j, k]) / dy
+
+                    if uz > 0:
+                        dC_dz = (concentration_field[i, j, k] - concentration_field[i, j, k - 1]) / dz
+                    else:
+                        dC_dz = (concentration_field[i, j, k + 1] - concentration_field[i, j, k]) / dz
+
+                    convective[i, j, k] = ux * dC_dx + uy * dC_dy + uz * dC_dz
+
+        return convective
+
+    def _apply_ventilation_boundary_conditions(
+        self,
+        concentration_field: np.ndarray,
+        inlet_gx: int,
+        inlet_gy: int,
+        inlet_gz: int,
+        outlet_gx: int,
+        outlet_gy: int,
+        outlet_gz: int,
+        dt: float
+    ) -> np.ndarray:
+        """
+        应用通风边界条件：入口为室外PM2.5，出口强制排风
+        """
+        new_field = concentration_field.copy()
+
+        inlet_radius = max(1, self.grid_resolution // 5)
+
+        for di in range(-inlet_radius, inlet_radius + 1):
+            for dj in range(-inlet_radius, inlet_radius + 1):
+                for dk in range(-inlet_radius, inlet_radius + 1):
+                    i = inlet_gx + di
+                    j = inlet_gy + dj
+                    k = inlet_gz + dk
+                    if 0 <= i < self.grid_resolution and 0 <= j < self.grid_resolution and 0 <= k < self.grid_resolution:
+                        dist = math.sqrt(di ** 2 + dj ** 2 + dk ** 2)
+                        if dist <= inlet_radius:
+                            weight = math.exp(-dist / inlet_radius)
+                            new_field[i, j, k] = weight * self.outdoor_pm25 + (1 - weight) * new_field[i, j, k]
+
+        exhaust_strength = min(1.0, self._ventilation_decay * dt * 10)
+        for di in range(-inlet_radius, inlet_radius + 1):
+            for dj in range(-inlet_radius, inlet_radius + 1):
+                for dk in range(-inlet_radius, inlet_radius + 1):
+                    i = outlet_gx + di
+                    j = outlet_gy + dj
+                    k = outlet_gz + dk
+                    if 0 <= i < self.grid_resolution and 0 <= j < self.grid_resolution and 0 <= k < self.grid_resolution:
+                        dist = math.sqrt(di ** 2 + dj ** 2 + dk ** 2)
+                        if dist <= inlet_radius:
+                            weight = math.exp(-dist / inlet_radius) * exhaust_strength
+                            new_field[i, j, k] = (1 - weight) * new_field[i, j, k] + weight * self.outdoor_pm25
+
+        return new_field
 
     def calculate_diffusion_coefficient(
         self,
@@ -120,8 +325,14 @@ class AirQualityAnalyzer:
         initial_field: np.ndarray,
         D: float,
         dt: float = 1.0,
-        num_steps: int = 10
+        num_steps: int = 10,
+        air_change_rate: Optional[float] = None,
+        outdoor_pm25: Optional[float] = None
     ) -> np.ndarray:
+        """
+        求解三维对流扩散方程：∂C/∂t = D·∇²C - u·∇C - λ·(C - C_out)
+        包含：分子扩散项 + 对流项 + 通风稀释项
+        """
         field = initial_field.copy()
         nx, ny, nz = field.shape
 
@@ -129,8 +340,38 @@ class AirQualityAnalyzer:
         dy = self.room_size_y / max(ny - 1, 1)
         dz = self.room_size_z / max(nz - 1, 1)
 
-        for _ in range(num_steps):
+        if air_change_rate is not None or outdoor_pm25 is not None:
+            self.set_ventilation_parameters(
+                air_change_rate=air_change_rate,
+                outdoor_pm25=outdoor_pm25
+            )
+
+        if not hasattr(self, 'velocity_field') or self.velocity_field.shape[1:] != (nx, ny, nz):
+            self._calculate_velocity_field()
+
+        inlet_gx = int(self.inlet_position[0] / self.room_size_x * (nx - 1))
+        inlet_gy = int(self.inlet_position[1] / self.room_size_y * (ny - 1))
+        inlet_gz = int(self.inlet_position[2] / self.room_size_z * (nz - 1))
+        outlet_gx = int(self.outlet_position[0] / self.room_size_x * (nx - 1))
+        outlet_gy = int(self.outlet_position[1] / self.room_size_y * (ny - 1))
+        outlet_gz = int(self.outlet_position[2] / self.room_size_z * (nz - 1))
+
+        inlet_gx = max(0, min(nx - 1, inlet_gx))
+        inlet_gy = max(0, min(ny - 1, inlet_gy))
+        inlet_gz = max(0, min(nz - 1, inlet_gz))
+        outlet_gx = max(0, min(nx - 1, outlet_gx))
+        outlet_gy = max(0, min(ny - 1, outlet_gy))
+        outlet_gz = max(0, min(nz - 1, outlet_gz))
+
+        lambda_vent = self._ventilation_decay
+        C_out = self.outdoor_pm25
+
+        for step in range(num_steps):
             new_field = field.copy()
+
+            convective_term = self._calculate_convective_term(
+                field, self.velocity_field, dx, dy, dz
+            )
 
             for i in range(1, nx - 1):
                 for j in range(1, ny - 1):
@@ -140,12 +381,29 @@ class AirQualityAnalyzer:
                             (field[i, j + 1, k] - 2 * field[i, j, k] + field[i, j - 1, k]) / (dy ** 2) +
                             (field[i, j, k + 1] - 2 * field[i, j, k] + field[i, j, k - 1]) / (dz ** 2)
                         )
-                        new_field[i, j, k] = field[i, j, k] + D * dt * laplacian
 
-            for axis in [0, 1, 2]:
-                new_field = np.clip(new_field, 0, None)
+                        diffusion_term = D * laplacian
+                        convection_term = convective_term[i, j, k]
+                        ventilation_term = -lambda_vent * (field[i, j, k] - C_out)
 
+                        dC_dt = diffusion_term - convection_term + ventilation_term
+                        new_field[i, j, k] = field[i, j, k] + dC_dt * dt
+
+            new_field = self._apply_ventilation_boundary_conditions(
+                new_field,
+                inlet_gx, inlet_gy, inlet_gz,
+                outlet_gx, outlet_gy, outlet_gz,
+                dt
+            )
+
+            new_field = np.clip(new_field, 0, None)
             field = new_field
+
+        logger.debug(
+            f"扩散求解完成: 迭代{num_steps}步, "
+            f"最终平均浓度={np.mean(field):.1f}μg/m³, "
+            f"换气率={self.air_change_rate}ACH, 室外PM2.5={C_out}μg/m³"
+        )
 
         return field
 
@@ -195,12 +453,19 @@ class AirQualityAnalyzer:
         nominal_pm25: float = 35.0
     ) -> float:
         avg_concentration = np.mean(concentration_field)
+
+        theoretical_ach_removal = 1.0 - math.exp(-self.air_change_rate / 60.0)
+        max_achievable_efficiency = min(100.0, theoretical_ach_removal * 100)
+
         if avg_concentration <= nominal_pm25:
-            efficiency = 100.0
+            ventilation_contribution = min(100.0, max_achievable_efficiency)
+            efficiency = ventilation_contribution
         else:
             reduction_ratio = (avg_concentration - nominal_pm25) / max(avg_concentration, 1e-6)
-            efficiency = max(0.0, (1.0 - reduction_ratio) * 100.0)
-        return efficiency
+            purification_efficiency = max(0.0, (1.0 - reduction_ratio) * 100.0)
+            efficiency = 0.4 * purification_efficiency + 0.6 * max_achievable_efficiency
+
+        return min(100.0, max(0.0, efficiency))
 
     def analyze(
         self,
@@ -210,7 +475,9 @@ class AirQualityAnalyzer:
         settling_efficiency: float,
         ambient_temperature: float = 25.0,
         ambient_humidity: float = 50.0,
-        oil_consumption: Optional[float] = None
+        oil_consumption: Optional[float] = None,
+        air_change_rate: Optional[float] = None,
+        outdoor_pm25: Optional[float] = None
     ) -> Tuple[Dict, List[Dict]]:
         D = self.calculate_diffusion_coefficient(ambient_temperature, ambient_humidity)
 
@@ -222,7 +489,14 @@ class AirQualityAnalyzer:
             settling_efficiency=settling_efficiency
         )
 
-        diffused_field = self.solve_diffusion(initial_field, D, dt=1.0, num_steps=5)
+        diffused_field = self.solve_diffusion(
+            initial_field,
+            D,
+            dt=1.0,
+            num_steps=5,
+            air_change_rate=air_change_rate,
+            outdoor_pm25=outdoor_pm25
+        )
 
         purified_field = self.apply_purification(diffused_field, settling_efficiency, flue_velocity)
 
@@ -253,6 +527,9 @@ class AirQualityAnalyzer:
             "air_change_efficiency": round(air_change_efficiency, 2),
             "aqi_level": aqi_level,
             "health_risk": health_risk,
+            "air_change_rate": round(self.air_change_rate, 2),
+            "outdoor_pm25": round(self.outdoor_pm25, 1),
+            "ventilation_decay": round(self._ventilation_decay, 6),
         }
 
         grid_data = []

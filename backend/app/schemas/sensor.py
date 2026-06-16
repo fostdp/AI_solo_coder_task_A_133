@@ -13,6 +13,9 @@ class SensorDataCreate(BaseModel):
     ambient_temperature: Optional[float] = Field(None, description="环境温度 °C")
     ambient_humidity: Optional[float] = Field(None, description="环境湿度 %")
     blockage_degree: Optional[float] = Field(None, description="烟道堵塞程度")
+    fuel_type: Optional[str] = Field(None, description="燃料类型: animal_fat, sesame_oil, beeswax, mineral_oil, tallow")
+    air_change_rate: Optional[float] = Field(None, ge=0, description="室内换气率 次/小时")
+    outdoor_pm25: Optional[float] = Field(None, ge=0, description="室外PM2.5浓度 μg/m³")
     timestamp: Optional[int] = Field(None, description="Unix时间戳")
     time: Optional[str] = Field(None, description="ISO时间字符串")
 
@@ -35,6 +38,9 @@ class SensorDataResponse(BaseModel):
 class FlueSimulationResponse(BaseModel):
     time: datetime
     lamp_id: int
+    fuel_type: Optional[str] = None
+    fuel_name: Optional[str] = None
+    heating_value: Optional[float] = None
     reynolds_number: float
     prandtl_number: float
     nusselt_number: float
@@ -60,6 +66,9 @@ class AirQualityResponse(BaseModel):
     air_change_efficiency: float
     aqi_level: str
     health_risk: str
+    air_change_rate: Optional[float] = None
+    outdoor_pm25: Optional[float] = None
+    ventilation_decay: Optional[float] = None
 
     class Config:
         from_attributes = True

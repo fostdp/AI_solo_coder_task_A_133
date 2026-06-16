@@ -19,7 +19,7 @@ from ..schemas.sensor import (
     StatisticsResponse,
     LampResponse
 )
-from ..services.flue_simulation import FlueFluidSimulator
+from ..services.flue_simulation import FlueFluidSimulator, FUEL_TYPES
 from ..services.air_quality import AirQualityAnalyzer
 from ..services.alert_service import alert_service
 from ..config import settings
@@ -33,7 +33,11 @@ air_quality_analyzer = AirQualityAnalyzer(
     room_size_x=settings.ROOM_SIZE_X,
     room_size_y=settings.ROOM_SIZE_Y,
     room_size_z=settings.ROOM_SIZE_Z,
-    grid_resolution=settings.GRID_RESOLUTION
+    grid_resolution=settings.GRID_RESOLUTION,
+    air_change_rate=settings.AIR_CHANGE_RATE,
+    outdoor_pm25=settings.OUTDOOR_PM25,
+    inlet_position=settings.VENTILATION_INLET,
+    outlet_position=settings.VENTILATION_OUTLET
 )
 
 
@@ -66,12 +70,17 @@ async def ingest_sensor_data(
     ambient_temp = data.ambient_temperature or 25.0
     ambient_hum = data.ambient_humidity or 50.0
 
+    fuel_type = data.fuel_type or settings.DEFAULT_FUEL_TYPE
+    air_change_rate = data.air_change_rate if data.air_change_rate is not None else settings.AIR_CHANGE_RATE
+    outdoor_pm25 = data.outdoor_pm25 if data.outdoor_pm25 is not None else settings.OUTDOOR_PM25
+
     flue_result = flue_simulator.simulate(
         flue_temperature=data.flue_temperature,
         flue_velocity=data.flue_velocity,
         ambient_temperature=ambient_temp,
         ambient_humidity=ambient_hum,
-        oil_consumption=data.oil_consumption
+        oil_consumption=data.oil_consumption,
+        fuel_type=fuel_type
     )
 
     flue_stmt = insert(FlueSimulation).values(
@@ -96,7 +105,9 @@ async def ingest_sensor_data(
         settling_efficiency=flue_result["settling_efficiency"],
         ambient_temperature=ambient_temp,
         ambient_humidity=ambient_hum,
-        oil_consumption=data.oil_consumption
+        oil_consumption=data.oil_consumption,
+        air_change_rate=air_change_rate,
+        outdoor_pm25=outdoor_pm25
     )
 
     aq_stmt = insert(AirQualityAnalysis).values(
@@ -303,14 +314,32 @@ async def get_latest_pm25_grid(
     )
 
 
+@router.get("/simulation/fuel-types")
+async def get_fuel_types():
+    """获取支持的燃料类型列表"""
+    result = []
+    for key, props in FUEL_TYPES.items():
+        result.append({
+            "fuel_type": key,
+            "name": props["name"],
+            "heating_value_mjkg": props["heating_value"],
+            "modbus_value": props["modbus_value"]
+        })
+    return {"fuel_types": result}
+
+
 @router.get("/simulation/particles")
 async def get_particle_trajectories(
     flue_velocity: float = Query(0.5, ge=0.01, le=5.0),
     flue_temperature: float = Query(120.0, ge=20, le=300),
-    num_particles: int = Query(20, ge=1, le=100)
+    num_particles: int = Query(20, ge=1, le=100),
+    fuel_type: Optional[str] = Query(None, description="燃料类型")
 ):
     trajectories = []
     import random
+
+    if fuel_type and fuel_type in FUEL_TYPES:
+        flue_simulator.set_fuel_type(fuel_type)
 
     for i in range(num_particles):
         start_x = random.uniform(-0.02, 0.02)
@@ -323,7 +352,8 @@ async def get_particle_trajectories(
             T_inlet=flue_temperature,
             T_ambient=25.0,
             dt=0.005,
-            num_steps=300
+            num_steps=300,
+            fuel_type=fuel_type
         )
         trajectories.append({
             "particle_id": i,
@@ -333,6 +363,8 @@ async def get_particle_trajectories(
     return {
         "flue_length": flue_simulator.params.flue_length,
         "flue_diameter": flue_simulator.params.flue_diameter,
+        "fuel_type": fuel_type or flue_simulator.current_fuel_type,
+        "fuel_name": FUEL_TYPES[fuel_type or flue_simulator.current_fuel_type]["name"],
         "trajectories": trajectories
     }
 
