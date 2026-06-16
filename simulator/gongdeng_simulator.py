@@ -10,6 +10,7 @@ import random
 import math
 import logging
 import json
+import os
 from datetime import datetime
 from pyModbusTCP.server import ModbusServer, DataBank
 from pyModbusTCP.client import ModbusClient
@@ -158,17 +159,18 @@ class GongdengSensorSimulator:
         return temp, humidity
 
     def _random_anomaly(self):
-        r = random.random()
-        if r < 0.02:
-            self.blockage_degree = min(0.9, self.blockage_degree + 0.1)
-            logger.warning(f"烟道堵塞程度增加: {self.blockage_degree:.2f}")
-        elif r < 0.05 and self.blockage_degree > 0:
-            self.blockage_degree = max(0, self.blockage_degree - 0.05)
+        if getattr(self, '_inject_anomalies', True):
+            r = random.random()
+            if r < 0.02:
+                self.blockage_degree = min(0.9, self.blockage_degree + 0.1)
+                logger.warning(f"烟道堵塞程度增加: {self.blockage_degree:.2f}")
+            elif r < 0.05 and self.blockage_degree > 0:
+                self.blockage_degree = max(0, self.blockage_degree - 0.05)
+
+            if random.random() < 0.03:
+                self.flame_intensity = max(0.3, min(1.0, self.flame_intensity + random.gauss(0, 0.1)))
 
         self.blockage_factor = 1.0 + self.blockage_degree * 2.0
-
-        if random.random() < 0.03:
-            self.flame_intensity = max(0.3, min(1.0, self.flame_intensity + random.gauss(0, 0.1)))
 
     def generate_sensor_data(self) -> dict:
         self._random_anomaly()
@@ -280,9 +282,9 @@ class GongdengSensorSimulator:
                 if self.enable_modbus:
                     read_data = await self.read_via_modbus_client()
                     if read_data:
-                        logger.debug(f"Modbus读取验证: {json.dumps(read_data, ensure_ascii=False)}")
+                    logger.debug(f"Modbus读取验证: {json.dumps(read_data, ensure_ascii=False)}")
 
-                await asyncio.sleep(60)
+                await asyncio.sleep(getattr(self, '_report_interval', 60))
 
             except KeyboardInterrupt:
                 logger.info("模拟器已停止")
@@ -292,16 +294,94 @@ class GongdengSensorSimulator:
                 await asyncio.sleep(5)
 
 
+def _str_to_bool(s: str) -> bool:
+    """将字符串转换为布尔值"""
+    return str(s).lower() in ("true", "1", "yes", "y", "on")
+
+
 async def main():
     import argparse
-    parser = argparse.ArgumentParser(description="长信宫灯Modbus TCP传感器模拟器")
-    parser.add_argument("--lamp-id", type=int, default=1, help="宫灯ID")
-    parser.add_argument("--modbus-host", type=str, default="0.0.0.0", help="Modbus服务地址")
-    parser.add_argument("--modbus-port", type=int, default=502, help="Modbus端口")
-    parser.add_argument("--api-url", type=str, default="http://localhost:8000", help="后端API地址")
-    parser.add_argument("--no-modbus", action="store_true", help="禁用Modbus TCP服务")
-    parser.add_argument("--no-http", action="store_true", help="禁用HTTP上报")
+    parser = argparse.ArgumentParser(
+        description="长信宫灯Modbus TCP传感器模拟器",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  # 使用默认配置
+  python gongdeng_simulator.py
+
+  # 指定燃料类型和通风率
+  python gongdeng_simulator.py --fuel-type beeswax --air-change-rate 2.5
+
+  # 禁用异常注入，稳定输出
+  python gongdeng_simulator.py --no-anomalies --fuel-type mineral_oil
+
+  # 仅HTTP上报，不启用Modbus
+  python gongdeng_simulator.py --no-modbus --report-interval 30
+
+支持的燃料类型:
+  animal_fat  (动物脂肪, 热值37.5 MJ/kg)
+  sesame_oil  (麻油,     热值39.3 MJ/kg)
+  beeswax     (蜜蜡,     热值40.6 MJ/kg)
+  mineral_oil (矿物油,   热值44.0 MJ/kg)
+  tallow      (牛油,     热值39.0 MJ/kg)
+        """
+    )
+
+    # 基本配置
+    parser.add_argument("--lamp-id", type=int,
+                        default=int(os.getenv("LAMP_ID", "1")),
+                        help="宫灯ID (默认: 1, 环境变量: LAMP_ID)")
+    parser.add_argument("--modbus-host", type=str,
+                        default=os.getenv("MODBUS_HOST", "0.0.0.0"),
+                        help="Modbus服务地址 (环境变量: MODBUS_HOST)")
+    parser.add_argument("--modbus-port", type=int,
+                        default=int(os.getenv("MODBUS_PORT", "502")),
+                        help="Modbus端口 (环境变量: MODBUS_PORT)")
+    parser.add_argument("--api-url", type=str,
+                        default=os.getenv("API_URL", "http://localhost:8000"),
+                        help="后端API地址 (环境变量: API_URL)")
+    parser.add_argument("--report-interval", type=int,
+                        default=int(os.getenv("REPORT_INTERVAL", "60")),
+                        help="数据上报间隔（秒）(环境变量: REPORT_INTERVAL)")
+
+    # 功能开关
+    parser.add_argument("--no-modbus", action="store_true",
+                        default=not _str_to_bool(os.getenv("ENABLE_MODBUS", "true")),
+                        help="禁用Modbus TCP服务")
+    parser.add_argument("--no-http", action="store_true",
+                        default=not _str_to_bool(os.getenv("ENABLE_HTTP", "true")),
+                        help="禁用HTTP上报")
+    parser.add_argument("--no-anomalies", action="store_true",
+                        default=not _str_to_bool(os.getenv("INJECT_ANOMALIES", "true")),
+                        help="禁用烟道堵塞等随机异常注入")
+
+    # 实验参数（核心可配置项）
+    parser.add_argument("--fuel-type", type=str,
+                        default=os.getenv("FUEL_TYPE", "animal_fat"),
+                        choices=["animal_fat", "sesame_oil", "beeswax", "mineral_oil", "tallow"],
+                        help="灯油燃料类型 (环境变量: FUEL_TYPE)")
+    parser.add_argument("--air-change-rate", type=float,
+                        default=float(os.getenv("AIR_CHANGE_RATE", "1.0")),
+                        help="室内通风换气率 ACH（次/小时）, 范围 0-20 (环境变量: AIR_CHANGE_RATE)")
+    parser.add_argument("--outdoor-pm25", type=float,
+                        default=float(os.getenv("OUTDOOR_PM25", "25.0")),
+                        help="室外PM2.5基准浓度 μg/m³ (环境变量: OUTDOOR_PM25)")
+
+    # 初始条件
+    parser.add_argument("--flame-intensity", type=float,
+                        default=0.8,
+                        help="初始火焰强度 0-1 (默认: 0.8)")
+    parser.add_argument("--initial-oil-level", type=float,
+                        default=500.0,
+                        help="初始油量 ml (默认: 500)")
+
     args = parser.parse_args()
+
+    # 参数合法性校验
+    args.air_change_rate = max(0.0, min(20.0, args.air_change_rate))
+    args.outdoor_pm25 = max(0.0, min(500.0, args.outdoor_pm25))
+    args.flame_intensity = max(0.1, min(1.0, args.flame_intensity))
+    args.report_interval = max(1, args.report_interval)
 
     simulator = GongdengSensorSimulator(
         lamp_id=args.lamp_id,
@@ -309,8 +389,37 @@ async def main():
         modbus_port=args.modbus_port,
         api_url=args.api_url,
         enable_modbus=not args.no_modbus,
-        enable_http=not args.no_http
+        enable_http=not args.no_http,
+        fuel_type=args.fuel_type,
+        air_change_rate=args.air_change_rate,
+        outdoor_pm25=args.outdoor_pm25
     )
+
+    # 应用初始条件
+    simulator.flame_intensity = args.flame_intensity
+    simulator.oil_level = args.initial_oil_level
+    simulator._inject_anomalies = not args.no_anomalies
+    simulator._report_interval = args.report_interval
+
+    # 启动时打印配置摘要
+    logger.info("=" * 60)
+    logger.info("模拟器配置摘要")
+    logger.info("=" * 60)
+    logger.info(f"宫灯ID:          {simulator.lamp_id}")
+    logger.info(f"Modbus TCP:      {simulator.modbus_host}:{simulator.modbus_port} "
+                f"({'启用' if simulator.enable_modbus else '禁用'})")
+    logger.info(f"API地址:         {simulator.api_url} "
+                f"({'启用' if simulator.enable_http else '禁用'})")
+    logger.info(f"上报间隔:        {simulator._report_interval} 秒")
+    logger.info(f"燃料类型:        {FUEL_TYPES[simulator.fuel_type]['name']} "
+                f"({simulator.fuel_type})")
+    logger.info(f"通风换气率:      {simulator.air_change_rate:.1f} ACH")
+    logger.info(f"室外PM2.5:       {simulator.outdoor_pm25:.1f} μg/m³")
+    logger.info(f"火焰强度:        {simulator.flame_intensity:.2f}")
+    logger.info(f"异常注入:        {'启用' if simulator._inject_anomalies else '禁用'}")
+    logger.info(f"初始油量:        {simulator.oil_level:.0f} ml")
+    logger.info("=" * 60)
+
     await simulator.run()
 
 
