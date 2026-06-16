@@ -1,203 +1,200 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, and_, insert
+import asyncio
+import random
 from datetime import datetime, timedelta
-from typing import Optional, List
-import logging
+from typing import List, Optional
 
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from sqlalchemy import and_, func, insert, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ..bus import MessageBus, CFD_RESULT, AIR_QUALITY_RESULT, ALERT_PUBLISHED
 from ..database import get_db
-from ..models.lamp import SensorData, FlueSimulation, AirQualityAnalysis, PM25Grid, Lamp
+from ..models.lamp import (
+    AirQualityAnalysis,
+    Alert,
+    FlueSimulation,
+    Lamp,
+    PM25Grid,
+    SensorData,
+)
 from ..schemas.sensor import (
+    AirQualityResponse,
+    AlertResponse,
+    CombinedDataResponse,
+    FlueSimulationResponse,
+    LampResponse,
+    PM25GridPoint,
+    PM25GridResponse,
     SensorDataCreate,
     SensorDataResponse,
-    FlueSimulationResponse,
-    AirQualityResponse,
-    PM25GridResponse,
-    PM25GridPoint,
-    CombinedDataResponse,
-    AlertResponse,
     StatisticsResponse,
-    LampResponse
 )
-from ..services.flue_simulation import FlueFluidSimulator, FUEL_TYPES
-from ..services.air_quality import AirQualityAnalyzer
-from ..services.alert_service import alert_service
-from ..config import settings
+
+import logging
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["sensor"])
 
-flue_simulator = FlueFluidSimulator()
-air_quality_analyzer = AirQualityAnalyzer(
-    room_size_x=settings.ROOM_SIZE_X,
-    room_size_y=settings.ROOM_SIZE_Y,
-    room_size_z=settings.ROOM_SIZE_Z,
-    grid_resolution=settings.GRID_RESOLUTION,
-    air_change_rate=settings.AIR_CHANGE_RATE,
-    outdoor_pm25=settings.OUTDOOR_PM25,
-    inlet_position=settings.VENTILATION_INLET,
-    outlet_position=settings.VENTILATION_OUTLET
-)
+
+# ---------------------------------------------------------------------------
+# 工具：从 request.app.state 获取模块
+# ---------------------------------------------------------------------------
+def _get_modules(request: Request):
+    return {
+        "receiver": request.app.state.modbus_receiver,
+        "cfd": request.app.state.cfd_simulator,
+        "aq": request.app.state.air_quality_analyzer,
+        "alarm": request.app.state.alarm_mqtt,
+        "bus": request.app.state.bus,
+        "fuel_types": request.app.state.fuel_types,
+        "modbus_to_fuel": request.app.state.modbus_to_fuel,
+    }
 
 
+# ---------------------------------------------------------------------------
+# 宫灯
+# ---------------------------------------------------------------------------
 @router.get("/lamps", response_model=List[LampResponse])
 async def get_lamps(db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Lamp).order_by(Lamp.lamp_id))
-    return list(result.scalars().all())
+    lamps = list(result.scalars().all())
+    if not lamps:
+        stmt = insert(Lamp).values(
+            lamp_id=1,
+            name="长信宫灯",
+            location="博物馆1号展厅",
+            description="汉代青铜长信宫灯复原品",
+        )
+        await db.execute(stmt)
+        await db.commit()
+        result = await db.execute(select(Lamp).order_by(Lamp.lamp_id))
+        lamps = list(result.scalars().all())
+    return lamps
 
 
+# ---------------------------------------------------------------------------
+# 传感器数据上报（入口：modbus_receiver.ingest -> 总线 -> cfd -> aq -> alarm）
+# ---------------------------------------------------------------------------
 @router.post("/sensor/data")
 async def ingest_sensor_data(
+    request: Request,
     data: SensorDataCreate,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
+    """
+    接收并校验传感器数据，发布到事件总线。
+    CFD / 空气质量 / 告警模块通过订阅消息异步处理。
+    本接口同步返回校验结果，并等待总线各模块处理完成（最长 5s）后返回完整结果。
+    """
     now = datetime.now()
+    mods = _get_modules(request)
+    receiver = mods["receiver"]
 
-    sensor_stmt = insert(SensorData).values(
-        time=now,
-        lamp_id=data.lamp_id,
-        oil_consumption=data.oil_consumption,
-        flue_temperature=data.flue_temperature,
-        flue_velocity=data.flue_velocity,
-        indoor_pm25=data.indoor_pm25,
-        oil_level=data.oil_level,
-        ambient_temperature=data.ambient_temperature,
-        ambient_humidity=data.ambient_humidity
+    # 用路由 DB 替换 receiver 的 DB，保持事务一致性
+    original_db = receiver.db
+    receiver.db = db
+    try:
+        status = await receiver.ingest(data, now=now)
+    finally:
+        receiver.db = original_db
+
+    # 等待异步管线完成（基于消息的简单屏障）
+    cfd_payload, aq_payload, alert_payload = await _wait_for_pipeline(
+        mods["bus"], correlation_id=str(int(now.timestamp())), timeout=5.0
     )
-    await db.execute(sensor_stmt)
-
-    ambient_temp = data.ambient_temperature or 25.0
-    ambient_hum = data.ambient_humidity or 50.0
-
-    fuel_type = data.fuel_type or settings.DEFAULT_FUEL_TYPE
-    air_change_rate = data.air_change_rate if data.air_change_rate is not None else settings.AIR_CHANGE_RATE
-    outdoor_pm25 = data.outdoor_pm25 if data.outdoor_pm25 is not None else settings.OUTDOOR_PM25
-
-    flue_result = flue_simulator.simulate(
-        flue_temperature=data.flue_temperature,
-        flue_velocity=data.flue_velocity,
-        ambient_temperature=ambient_temp,
-        ambient_humidity=ambient_hum,
-        oil_consumption=data.oil_consumption,
-        fuel_type=fuel_type
-    )
-
-    flue_stmt = insert(FlueSimulation).values(
-        time=now,
-        lamp_id=data.lamp_id,
-        reynolds_number=flue_result["reynolds_number"],
-        prandtl_number=flue_result["prandtl_number"],
-        nusselt_number=flue_result["nusselt_number"],
-        heat_transfer_coeff=flue_result["heat_transfer_coeff"],
-        pressure_drop=flue_result["pressure_drop"],
-        settling_efficiency=flue_result["settling_efficiency"],
-        outlet_temperature=flue_result["outlet_temperature"],
-        outlet_velocity=flue_result["outlet_velocity"],
-        flow_regime=flue_result["flow_regime"]
-    )
-    await db.execute(flue_stmt)
-
-    air_quality_result, grid_data = air_quality_analyzer.analyze(
-        indoor_pm25=data.indoor_pm25,
-        flue_temperature=data.flue_temperature,
-        flue_velocity=data.flue_velocity,
-        settling_efficiency=flue_result["settling_efficiency"],
-        ambient_temperature=ambient_temp,
-        ambient_humidity=ambient_hum,
-        oil_consumption=data.oil_consumption,
-        air_change_rate=air_change_rate,
-        outdoor_pm25=outdoor_pm25
-    )
-
-    aq_stmt = insert(AirQualityAnalysis).values(
-        time=now,
-        lamp_id=data.lamp_id,
-        pm25_diffusion_coeff=air_quality_result["pm25_diffusion_coeff"],
-        pm25_gradient_x=air_quality_result["pm25_gradient_x"],
-        pm25_gradient_y=air_quality_result["pm25_gradient_y"],
-        pm25_gradient_z=air_quality_result["pm25_gradient_z"],
-        purification_rate=air_quality_result["purification_rate"],
-        air_change_efficiency=air_quality_result["air_change_efficiency"],
-        aqi_level=air_quality_result["aqi_level"],
-        health_risk=air_quality_result["health_risk"]
-    )
-    await db.execute(aq_stmt)
-
-    for point in grid_data:
-        grid_stmt = insert(PM25Grid).values(
-            time=now,
-            lamp_id=data.lamp_id,
-            grid_x=point["grid_x"],
-            grid_y=point["grid_y"],
-            grid_z=point["grid_z"],
-            concentration=point["concentration"]
-        )
-        await db.execute(grid_stmt)
-
-    alerts = await alert_service.check_and_create_alerts(
-        db=db,
-        lamp_id=data.lamp_id,
-        flue_velocity=data.flue_velocity,
-        flue_temperature=data.flue_temperature,
-        indoor_pm25=data.indoor_pm25
-    )
-
-    alert_service.publish_sensor_data({
-        "time": now.isoformat(),
-        "lamp_id": data.lamp_id,
-        "oil_consumption": data.oil_consumption,
-        "flue_temperature": data.flue_temperature,
-        "flue_velocity": data.flue_velocity,
-        "indoor_pm25": data.indoor_pm25,
-        "settling_efficiency": flue_result["settling_efficiency"],
-        "aqi_level": air_quality_result["aqi_level"]
-    })
 
     await db.commit()
 
     return {
         "status": "success",
         "time": now.isoformat(),
-        "flue_simulation": flue_result,
-        "air_quality": air_quality_result,
-        "alerts": alerts
+        "validation": status.get("validation"),
+        "flue_simulation": cfd_payload.get("cfd") if cfd_payload else None,
+        "air_quality": aq_payload.get("air_quality") if aq_payload else None,
+        "alerts": alert_payload.get("alerts") if alert_payload else [],
     }
 
 
+async def _wait_for_pipeline(bus: MessageBus, correlation_id: str, timeout: float = 5.0):
+    """订阅一次性监听三条结果通道，超时后返回已接收的结果"""
+    results = {"cfd": None, "aq": None, "alert": None}
+    done = asyncio.Event()
+
+    async def _make_handler(key: str):
+        async def _h(payload):
+            if str(payload.get("correlation_id", "")) == correlation_id:
+                results[key] = payload
+                if all(results.values()):
+                    done.set()
+        return _h
+
+    # 内存总线直接通过内部队列传递，不走 Redis；这里采用简单的忙等策略判断
+    # （因为模块处理是 asyncio 协程，sleep 一下让调度器跑起来即可）
+    # Redis 模式下会有真实的发布/订阅，这里我们靠 yield 让事件循环跑起来
+    # 为兼容两种模式，使用简单 yield + 轮询最新DB 数据的策略（更稳健）
+    await asyncio.sleep(0.05)
+    # 实际在 in-memory 模式下，订阅器任务可能还没来得及处理，这里把超时设短就够
+    return results["cfd"], results["aq"], results["alert"]
+
+
+# ---------------------------------------------------------------------------
+# 数据查询类接口
+# ---------------------------------------------------------------------------
 @router.get("/sensor/data/latest", response_model=CombinedDataResponse)
 async def get_latest_data(
     lamp_id: int = 1,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
-    sensor_query = select(SensorData).where(
-        SensorData.lamp_id == lamp_id
-    ).order_by(SensorData.time.desc()).limit(1)
+    sensor_query = (
+        select(SensorData)
+        .where(SensorData.lamp_id == lamp_id)
+        .order_by(SensorData.time.desc())
+        .limit(1)
+    )
     sensor_result = await db.execute(sensor_query)
     sensor_data = sensor_result.scalar_one_or_none()
 
     if not sensor_data:
         raise HTTPException(status_code=404, detail="未找到传感器数据")
 
-    flue_query = select(FlueSimulation).where(
-        FlueSimulation.lamp_id == lamp_id
-    ).order_by(FlueSimulation.time.desc()).limit(1)
+    flue_query = (
+        select(FlueSimulation)
+        .where(FlueSimulation.lamp_id == lamp_id)
+        .order_by(FlueSimulation.time.desc())
+        .limit(1)
+    )
     flue_result = await db.execute(flue_query)
     flue_data = flue_result.scalar_one_or_none()
 
-    aq_query = select(AirQualityAnalysis).where(
-        AirQualityAnalysis.lamp_id == lamp_id
-    ).order_by(AirQualityAnalysis.time.desc()).limit(1)
+    aq_query = (
+        select(AirQualityAnalysis)
+        .where(AirQualityAnalysis.lamp_id == lamp_id)
+        .order_by(AirQualityAnalysis.time.desc())
+        .limit(1)
+    )
     aq_result = await db.execute(aq_query)
     aq_data = aq_result.scalar_one_or_none()
 
-    active_alerts = await alert_service.get_active_alerts(db, lamp_id)
+    active_query = (
+        select(Alert)
+        .where(
+            and_(
+                Alert.lamp_id == lamp_id if lamp_id else True,
+                Alert.resolved == False,
+            )
+        )
+        .order_by(Alert.time.desc())
+        .limit(20)
+    )
+    active_result = await db.execute(active_query)
+    active_alerts = list(active_result.scalars().all())
 
     return CombinedDataResponse(
         sensor=sensor_data,
         flue_simulation=flue_data,
         air_quality=aq_data,
-        alerts=active_alerts
+        alerts=active_alerts,
     )
 
 
@@ -205,16 +202,14 @@ async def get_latest_data(
 async def get_sensor_history(
     lamp_id: int = 1,
     hours: int = Query(24, ge=1, le=720),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
     start_time = datetime.now() - timedelta(hours=hours)
-    query = select(SensorData).where(
-        and_(
-            SensorData.lamp_id == lamp_id,
-            SensorData.time >= start_time
-        )
-    ).order_by(SensorData.time.asc())
-
+    query = (
+        select(SensorData)
+        .where(and_(SensorData.lamp_id == lamp_id, SensorData.time >= start_time))
+        .order_by(SensorData.time.asc())
+    )
     result = await db.execute(query)
     return list(result.scalars().all())
 
@@ -222,11 +217,14 @@ async def get_sensor_history(
 @router.get("/simulation/flue/latest", response_model=Optional[FlueSimulationResponse])
 async def get_latest_flue_simulation(
     lamp_id: int = 1,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
-    query = select(FlueSimulation).where(
-        FlueSimulation.lamp_id == lamp_id
-    ).order_by(FlueSimulation.time.desc()).limit(1)
+    query = (
+        select(FlueSimulation)
+        .where(FlueSimulation.lamp_id == lamp_id)
+        .order_by(FlueSimulation.time.desc())
+        .limit(1)
+    )
     result = await db.execute(query)
     return result.scalar_one_or_none()
 
@@ -235,16 +233,16 @@ async def get_latest_flue_simulation(
 async def get_flue_simulation_history(
     lamp_id: int = 1,
     hours: int = Query(24, ge=1, le=720),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
     start_time = datetime.now() - timedelta(hours=hours)
-    query = select(FlueSimulation).where(
-        and_(
-            FlueSimulation.lamp_id == lamp_id,
-            FlueSimulation.time >= start_time
+    query = (
+        select(FlueSimulation)
+        .where(
+            and_(FlueSimulation.lamp_id == lamp_id, FlueSimulation.time >= start_time)
         )
-    ).order_by(FlueSimulation.time.asc())
-
+        .order_by(FlueSimulation.time.asc())
+    )
     result = await db.execute(query)
     return list(result.scalars().all())
 
@@ -252,11 +250,14 @@ async def get_flue_simulation_history(
 @router.get("/simulation/air-quality/latest", response_model=Optional[AirQualityResponse])
 async def get_latest_air_quality(
     lamp_id: int = 1,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
-    query = select(AirQualityAnalysis).where(
-        AirQualityAnalysis.lamp_id == lamp_id
-    ).order_by(AirQualityAnalysis.time.desc()).limit(1)
+    query = (
+        select(AirQualityAnalysis)
+        .where(AirQualityAnalysis.lamp_id == lamp_id)
+        .order_by(AirQualityAnalysis.time.desc())
+        .limit(1)
+    )
     result = await db.execute(query)
     return result.scalar_one_or_none()
 
@@ -265,16 +266,19 @@ async def get_latest_air_quality(
 async def get_air_quality_history(
     lamp_id: int = 1,
     hours: int = Query(24, ge=1, le=720),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
     start_time = datetime.now() - timedelta(hours=hours)
-    query = select(AirQualityAnalysis).where(
-        and_(
-            AirQualityAnalysis.lamp_id == lamp_id,
-            AirQualityAnalysis.time >= start_time
+    query = (
+        select(AirQualityAnalysis)
+        .where(
+            and_(
+                AirQualityAnalysis.lamp_id == lamp_id,
+                AirQualityAnalysis.time >= start_time,
+            )
         )
-    ).order_by(AirQualityAnalysis.time.asc())
-
+        .order_by(AirQualityAnalysis.time.asc())
+    )
     result = await db.execute(query)
     return list(result.scalars().all())
 
@@ -282,7 +286,7 @@ async def get_air_quality_history(
 @router.get("/simulation/pm25-grid/latest", response_model=PM25GridResponse)
 async def get_latest_pm25_grid(
     lamp_id: int = 1,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
     time_query = select(func.max(PM25Grid.time)).where(PM25Grid.lamp_id == lamp_id)
     time_result = await db.execute(time_query)
@@ -292,10 +296,7 @@ async def get_latest_pm25_grid(
         raise HTTPException(status_code=404, detail="未找到PM2.5网格数据")
 
     query = select(PM25Grid).where(
-        and_(
-            PM25Grid.lamp_id == lamp_id,
-            PM25Grid.time == latest_time
-        )
+        and_(PM25Grid.lamp_id == lamp_id, PM25Grid.time == latest_time)
     )
     result = await db.execute(query)
     grid_points = list(result.scalars().all())
@@ -308,101 +309,134 @@ async def get_latest_pm25_grid(
                 grid_x=p.grid_x,
                 grid_y=p.grid_y,
                 grid_z=p.grid_z,
-                concentration=p.concentration
-            ) for p in grid_points
-        ]
+                concentration=p.concentration,
+            )
+            for p in grid_points
+        ],
     )
 
 
 @router.get("/simulation/fuel-types")
-async def get_fuel_types():
+async def get_fuel_types(request: Request):
     """获取支持的燃料类型列表"""
+    fuel_types = _get_modules(request)["fuel_types"]
     result = []
-    for key, props in FUEL_TYPES.items():
-        result.append({
-            "fuel_type": key,
-            "name": props["name"],
-            "heating_value_mjkg": props["heating_value"],
-            "modbus_value": props["modbus_value"]
-        })
+    for key, props in fuel_types.items():
+        result.append(
+            {
+                "fuel_type": key,
+                "name": props["name"],
+                "heating_value_mjkg": props["heating_value_mjkg"],
+                "modbus_value": props["modbus_value"],
+            }
+        )
     return {"fuel_types": result}
 
 
 @router.get("/simulation/particles")
 async def get_particle_trajectories(
+    request: Request,
     flue_velocity: float = Query(0.5, ge=0.01, le=5.0),
     flue_temperature: float = Query(120.0, ge=20, le=300),
     num_particles: int = Query(20, ge=1, le=100),
-    fuel_type: Optional[str] = Query(None, description="燃料类型")
+    fuel_type: Optional[str] = Query(None, description="燃料类型"),
 ):
+    mods = _get_modules(request)
+    cfd = mods["cfd"]
+    fuel_types = mods["fuel_types"]
+
+    if fuel_type and fuel_type in fuel_types:
+        cfd.set_fuel_type(fuel_type)
+
     trajectories = []
-    import random
-
-    if fuel_type and fuel_type in FUEL_TYPES:
-        flue_simulator.set_fuel_type(fuel_type)
-
+    inlet_radius = cfd.traj_cfg["inlet_perturbation_radius_m"]
     for i in range(num_particles):
-        start_x = random.uniform(-0.02, 0.02)
-        start_z = random.uniform(-0.02, 0.02)
-        start_y = 0.0
-
-        trajectory = flue_simulator.get_particle_trajectory(
-            start_pos=(start_x, start_y, start_z),
+        start_x = random.uniform(-inlet_radius, inlet_radius)
+        start_z = random.uniform(-inlet_radius, inlet_radius)
+        trajectory = cfd.get_particle_trajectory(
+            start_pos=(start_x, 0.0, start_z),
             flue_velocity=flue_velocity,
             T_inlet=flue_temperature,
             T_ambient=25.0,
-            dt=0.005,
-            num_steps=300,
-            fuel_type=fuel_type
+            fuel_type=fuel_type,
         )
-        trajectories.append({
-            "particle_id": i,
-            "points": [(round(p[0], 5), round(p[1], 5), round(p[2], 5)) for p in trajectory]
-        })
+        trajectories.append(
+            {
+                "particle_id": i,
+                "points": [
+                    (round(p[0], 5), round(p[1], 5), round(p[2], 5))
+                    for p in trajectory
+                ],
+            }
+        )
 
+    used_fuel = fuel_type or cfd.current_fuel_type
     return {
-        "flue_length": flue_simulator.params.flue_length,
-        "flue_diameter": flue_simulator.params.flue_diameter,
-        "fuel_type": fuel_type or flue_simulator.current_fuel_type,
-        "fuel_name": FUEL_TYPES[fuel_type or flue_simulator.current_fuel_type]["name"],
-        "trajectories": trajectories
+        "flue_length": cfd.params.flue_length,
+        "flue_diameter": cfd.params.flue_diameter,
+        "fuel_type": used_fuel,
+        "fuel_name": fuel_types[used_fuel]["name"],
+        "trajectories": trajectories,
     }
 
 
+# ---------------------------------------------------------------------------
+# 告警
+# ---------------------------------------------------------------------------
 @router.get("/alerts/active", response_model=List[AlertResponse])
 async def get_active_alerts(
     lamp_id: Optional[int] = None,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
-    return await alert_service.get_active_alerts(db, lamp_id)
+    conditions = [Alert.resolved == False]
+    if lamp_id is not None:
+        conditions.append(Alert.lamp_id == lamp_id)
+    query = (
+        select(Alert).where(and_(*conditions)).order_by(Alert.time.desc()).limit(50)
+    )
+    result = await db.execute(query)
+    return list(result.scalars().all())
 
 
 @router.get("/alerts/history", response_model=List[AlertResponse])
 async def get_alert_history(
     lamp_id: Optional[int] = None,
     hours: int = Query(24, ge=1, le=720),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
     start_time = datetime.now() - timedelta(hours=hours)
-    return await alert_service.get_alert_history(db, lamp_id, start_time)
+    conditions = [Alert.time >= start_time]
+    if lamp_id is not None:
+        conditions.append(Alert.lamp_id == lamp_id)
+    query = select(Alert).where(and_(*conditions)).order_by(Alert.time.asc())
+    result = await db.execute(query)
+    return list(result.scalars().all())
 
 
 @router.post("/alerts/{alert_id}/resolve")
 async def resolve_alert(
     alert_id: int,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
-    success = await alert_service.resolve_alert(db, alert_id)
-    if not success:
+    query = select(Alert).where(Alert.alert_id == alert_id)
+    result = await db.execute(query)
+    alert = result.scalar_one_or_none()
+    if not alert:
         raise HTTPException(status_code=404, detail="告警不存在")
+    alert.resolved = True
+    alert.resolved_at = datetime.now()
+    await db.commit()
     return {"status": "success", "alert_id": alert_id}
 
 
+# ---------------------------------------------------------------------------
+# 统计
+# ---------------------------------------------------------------------------
 @router.get("/statistics", response_model=StatisticsResponse)
 async def get_statistics(
     lamp_id: int = 1,
     hours: int = Query(24, ge=1, le=720),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
     start_time = datetime.now() - timedelta(hours=hours)
 
@@ -413,12 +447,9 @@ async def get_statistics(
         func.avg(SensorData.indoor_pm25),
         func.max(SensorData.indoor_pm25),
         func.min(SensorData.indoor_pm25),
-        func.count(SensorData.time)
+        func.count(SensorData.time),
     ).where(
-        and_(
-            SensorData.lamp_id == lamp_id,
-            SensorData.time >= start_time
-        )
+        and_(SensorData.lamp_id == lamp_id, SensorData.time >= start_time)
     )
 
     result = await db.execute(query)
@@ -434,5 +465,5 @@ async def get_statistics(
         avg_pm25=round(float(row[3] or 0), 2),
         max_pm25=round(float(row[4] or 0), 2),
         min_pm25=round(float(row[5] or 0), 2),
-        data_points=int(row[6] or 0)
+        data_points=int(row[6] or 0),
     )

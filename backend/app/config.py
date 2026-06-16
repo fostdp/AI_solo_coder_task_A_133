@@ -9,10 +9,14 @@ class Settings(BaseSettings):
 
     DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/changxin_gongdeng"
 
-    MQTT_BROKER: str = "localhost"
+    REDIS_URL: Optional[str] = None
+
+    MQTT_HOST: Optional[str] = None
     MQTT_PORT: int = 1883
     MQTT_USERNAME: Optional[str] = None
     MQTT_PASSWORD: Optional[str] = None
+    MQTT_TOPIC_PREFIX: str = "gongdeng"
+    MQTT_BROKER: str = "localhost"
     MQTT_TOPIC_ALERT: str = "gongdeng/alerts"
     MQTT_TOPIC_DATA: str = "gongdeng/sensor"
 

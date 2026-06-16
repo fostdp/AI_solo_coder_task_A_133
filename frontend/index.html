@@ -543,6 +543,13 @@
 
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
-    <script src="app.js"></script>
+    <script src="/static/gong_deng_3d.js"></script>
+    <script src="/static/air_quality_panel.js"></script>
+    <script>
+      window.addEventListener('DOMContentLoaded', () => {
+        if (typeof GongDeng3D !== 'undefined') GongDeng3D.init();
+        if (typeof AirQualityPanel !== 'undefined') AirQualityPanel.init();
+      });
+    </script>
 </body>
 </html>
